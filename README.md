@@ -36,7 +36,7 @@ README.md
 Установите необходимые библиотеки:
 
 bash
-pip install vosk pyaudio pywin32
+pip install vosk pyaudio pywin32 tqdm requests
 Скачайте русскую языковую модель Vosk (small) с официального сайта и распакуйте в папку со скриптом.
 
 Настройка

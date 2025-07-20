@@ -1,5 +1,0 @@
-2025-07-20 12:46:59,557 - INFO - Запуск голосового ассистента
-2025-07-20 12:47:00,573 - INFO - Голосовой движок инициализирован
-2025-07-20 12:47:00,575 - DEBUG - Release <POINTER(IMMDeviceEnumerator) ptr=0x1666b0c84c0 at 1666c66db50>
-2025-07-20 12:47:00,580 - DEBUG - Calling CoUninitialize()
-2025-07-20 12:47:00,580 - DEBUG - CoUninitialize() done.

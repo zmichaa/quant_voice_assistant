@@ -4,7 +4,8 @@ import threading
 import time
 from datetime import datetime
 import pyaudio
-from vosk import Model, KaldiRecognizer
+from vosk import Model, KaldiRecognizer, SetLogLevel
+SetLogLevel(-1)  # Отключаем логирование Vosk
 import os
 import win32com.client
 import sys
@@ -14,15 +15,79 @@ import ctypes
 from ctypes import cast, POINTER
 from comtypes import CLSCTX_ALL
 from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+import zipfile
+import shutil
+from tqdm import tqdm
+import requests
 
-# Конфигурация
-MODEL_VOSK = "vosk-model-small-ru-0.22"
-SAMPLE_RATE = 16000
-CHUNK_SIZE = 4000
-KEYWORDS = ["квант", "кван", "ван"]
-ACTIVE_TIMEOUT = 7
+# Конфигурационные параметры
+MODELS_DIR = "models"  # Папка для хранения моделей распознавания речи
+MODEL_NAME = "vosk-model-small-ru-0.22"  # Название модели Vosk
+MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-ru-0.22.zip"  # URL для скачивания модели
+SAMPLE_RATE = 16000  # Частота дискретизации аудио
+CHUNK_SIZE = 4000  # Размер чанка для аудиопотока
+KEYWORDS = ["квант", "кван", "ван"]  # Ключевые слова для активации
+ACTIVE_TIMEOUT = 7  # Таймаут неактивности в секундах
+
+def print_with_time(message):
+    """Выводит сообщение с текущим временем в формате [HH:MM:SS]"""
+    current_time = datetime.now().strftime("%H:%M:%S")
+    print(f"[{current_time}] {message}")
+
+def download_file(url, filename):
+    """Скачивает файл с отображением прогресса через tqdm"""
+    response = requests.get(url, stream=True)
+    total_size = int(response.headers.get('content-length', 0))
+    
+    with open(filename, 'wb') as f, tqdm(
+        desc=filename,
+        total=total_size,
+        unit='iB',
+        unit_scale=True,
+        unit_divisor=1024,
+    ) as bar:
+        for data in response.iter_content(chunk_size=1024):
+            size = f.write(data)
+            bar.update(size)
+
+def ensure_model_exists():
+    """Проверяет наличие модели речи и скачивает при необходимости"""
+    model_path = os.path.join(MODELS_DIR, MODEL_NAME)
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    
+    if os.path.exists(model_path):
+        print_with_time("Модель для распознавания речи готова")
+        return True
+    
+    print_with_time(f"Модель {MODEL_NAME} не найдена, начинаю загрузку...")
+    
+    try:
+        zip_path = os.path.join(MODELS_DIR, "temp_model.zip")
+        download_file(MODEL_URL, zip_path)
+        
+        # Распаковываем архив с моделью
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            file_list = zip_ref.namelist()
+            for file in tqdm(file_list, desc="Распаковка"):
+                zip_ref.extract(file, MODELS_DIR)
+        
+        os.remove(zip_path)
+        
+        # Проверяем корректность распаковки
+        if not os.path.exists(model_path):
+            extracted_dir = os.path.join(MODELS_DIR, file_list[0].split('/')[0])
+            if os.path.exists(extracted_dir):
+                shutil.move(extracted_dir, model_path)
+        
+        print_with_time("Модель для распознавания готова")
+        return True
+    
+    except Exception as e:
+        print_with_time(f"Ошибка при загрузке модели: {e}")
+        return False
 
 class VolumeController:
+    """Контроллер громкости системы через Windows API"""
     def __init__(self):
         self.devices = AudioUtilities.GetSpeakers()
         self.interface = self.devices.Activate(
@@ -30,28 +95,37 @@ class VolumeController:
         self.volume = cast(self.interface, POINTER(IAudioEndpointVolume))
         
     def get_volume(self):
+        """Возвращает текущую громкость в процентах"""
         return int(self.volume.GetMasterVolumeLevelScalar() * 100)
     
     def set_volume(self, percent):
+        """Устанавливает громкость (0-100%)"""
         percent = max(0, min(100, percent))
         self.volume.SetMasterVolumeLevelScalar(percent / 100.0, None)
         return percent
 
 
 class VoiceAssistant:
+    """Основной класс голосового ассистента"""
     def __init__(self):
         self.start_time = datetime.now()
-        self.print_with_time(f"Запуск")
+        print_with_time("Запуск ассистента")
         
+        # Проверяем наличие модели распознавания речи
+        if not ensure_model_exists():
+            raise Exception("Не удалось загрузить модель распознавания")
+        
+        # Очередь для аудиоданных между потоками
         self.audio_queue = queue.Queue(maxsize=20)
-        self.is_running = True
-        self.is_active = False
-        self.last_activity = 0
-        self.last_command_time = 0
-        self.min_command_interval = 1.0
+        self.is_running = True  # Флаг работы основного цикла
+        self.is_active = False  # Флаг активного режима (после ключевого слова)
+        self.last_activity = 0  # Время последней активности
+        self.last_command_time = 0  # Время последней команды
+        self.min_command_interval = 1.0  # Минимальный интервал между командами
         
+        # Инициализация голосового движка (SAPI)
         self.voice_engine_ready = False
-        self.speaker_lock = threading.Lock()
+        self.speaker_lock = threading.Lock()  # Блокировка для синхронизации речи
         self.init_voice_engine()
         
         self.volume_controller = VolumeController()
@@ -68,10 +142,12 @@ class VoiceAssistant:
             'восемьдесят': 80, 'девяносто': 90, 'сто': 100
         }
         
+        # Инициализация распознавания речи
         self.init_asr()
         
         self.welcome_message = f"Готов. Скажите '{KEYWORDS[0]}'..."
         
+        # Регулярные выражения для распознавания команд
         self.patterns = {
             'greeting': re.compile(r'(привет|здравствуй|добрый день)'),
             'time': re.compile(r'(время|час|который час|сколько времени)'),
@@ -82,58 +158,62 @@ class VoiceAssistant:
             'volume_set': re.compile(r'(громкость на|установи громкость|поставь громкость|громкость)')
         }
 
+    def init_asr(self):
+        """Инициализация системы распознавания речи (ASR)"""
+        model_path = os.path.join(MODELS_DIR, MODEL_NAME)
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"Модель не найдена: {model_path}")
+        
+        self.model = Model(model_path)
+        self.recognizer = KaldiRecognizer(self.model, SAMPLE_RATE)
+        self.recognizer.SetWords(True)  # Включаем распознавание отдельных слов
+
     def init_voice_engine(self):
+        """Инициализация голосового движка (SAPI) с несколькими попытками"""
         max_retries = 3
         for attempt in range(max_retries):
             try:
                 self.speaker = win32com.client.Dispatch("SAPI.SpVoice")
-                time.sleep(1)
+                time.sleep(1)  # Даем время на инициализацию
                 self.voice_engine_ready = True
-                self.print_with_time("Голос готов")
+                print_with_time("Голосовой движок готов")
                 return
             except Exception as e:
                 if attempt < max_retries - 1:
                     time.sleep(2)
         
         self.voice_engine_ready = False
-        self.print_with_time("Ошибка голоса")
-
-    def print_with_time(self, message):
-        current_time = datetime.now().strftime("%H:%M:%S")
-        print(f"[{current_time}] {message}")
-
-    def init_asr(self):
-        if not os.path.exists(MODEL_VOSK):
-            raise FileNotFoundError(f"Модель не найдена: {MODEL_VOSK}")
-        
-        self.model = Model(MODEL_VOSK)
-        self.recognizer = KaldiRecognizer(self.model, SAMPLE_RATE)
-        self.recognizer.AcceptWaveform(b'\x00\x00' * 2000)
+        print_with_time("Ошибка инициализации голосового движка")
 
     def speak(self, text, interrupt=False):
+        """Произносит текст с возможностью прерывания текущей речи"""
         if not self.voice_engine_ready:
             return
             
-        self.print_with_time(f"Ответ: {text}")
-        self.last_command_time = time.time()
+        print_with_time(f"Ответ: {text}")
+        self.last_command_time = time.time()  # Обновляем время последней команды
         
         try:
-            with self.speaker_lock:
-                if interrupt and self.speaker.Status.RunningState == 2:
-                    self.speaker.Speak("", 2)
+            with self.speaker_lock:  # Блокируем для потокобезопасности
+                if interrupt and self.speaker.Status.RunningState == 2:  # 2 = speaking
+                    self.speaker.Speak("", 2)  # Прерываем текущую речь
                 
+                # Флаг 1 - асинхронное произношение, 0 - синхронное
                 self.speaker.Speak(text, 1 if interrupt else 0)
         except Exception as e:
+            # При ошибке пытаемся переинициализировать движок
             self.init_voice_engine()
 
     def deactivate(self, silent=False):
+        """Переводит ассистента в режим ожидания"""
         if self.is_active:
             self.is_active = False
             if not silent:
                 self.speak("Режим ожидания", interrupt=True)
-            self.audio_queue.queue.clear()
+            self.audio_queue.queue.clear()  # Очищаем очередь аудио
 
     def audio_capture(self):
+        """Поток для захвата аудио с микрофона"""
         p = pyaudio.PyAudio()
         stream = p.open(
             format=pyaudio.paInt16,
@@ -146,14 +226,17 @@ class VoiceAssistant:
             start=False
         )
         
-        self.print_with_time(self.welcome_message)
+        print_with_time(self.welcome_message)
+        print("-" * 40)
         stream.start_stream()
         
         try:
             while self.is_running:
                 try:
+                    # Читаем данные с микрофона без блокировки при переполнении
                     data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
                     
+                    # Очищаем очередь, если в режиме ожидания и очередь переполнена
                     if not self.is_active and self.audio_queue.qsize() > 5:
                         self.audio_queue.queue.clear()
                         
@@ -163,11 +246,13 @@ class VoiceAssistant:
                 except Exception as e:
                     break
         finally:
+            # Гарантированно останавливаем поток
             stream.stop_stream()
             stream.close()
             p.terminate()
 
     def process_audio(self):
+        """Поток для обработки аудио и распознавания команд"""
         last_processed_text = ""
         last_processed_time = 0
         
@@ -179,8 +264,9 @@ class VoiceAssistant:
                     result = json.loads(self.recognizer.Result())
                     text = result.get("text", "").strip().lower()
                     
+                    # Обрабатываем только новые команды (защита от дублирования)
                     if text and (time.time() - last_processed_time > 0.5 or text != last_processed_text):
-                        self.print_with_time(f"Распознано: {text}")
+                        print_with_time(f"Распознано: {text}")
                         self.handle_command(text)
                         last_processed_text = text
                         last_processed_time = time.time()
@@ -190,78 +276,70 @@ class VoiceAssistant:
             except queue.Empty:
                 continue
             except Exception as e:
-                self.print_with_time(f"Ошибка: {e}")
+                print_with_time(f"Ошибка обработки аудио: {e}")
 
     def handle_command(self, text):
+        """Определяет и выполняет команды из распознанного текста"""
         text_lower = text.lower()
         keyword_detected = any(keyword in text_lower for keyword in KEYWORDS)
         
+        # Активация по ключевому слову
         if keyword_detected:
             if not self.is_active:
                 self.activate()
+            # Удаляем ключевое слово из команды
             command = re.sub('|'.join(KEYWORDS), '', text_lower).strip()
             if command:
                 self.process_user_input(command)
             return
         
+        # Обработка команд в активном режиме
         if self.is_active:
-            self.last_activity = time.time()
+            self.last_activity = time.time()  # Обновляем время активности
             self.process_user_input(text_lower)
 
     def activate(self):
+        """Активирует режим ожидания команд"""
         if not self.is_active:
             self.is_active = True
             self.last_activity = time.time()
-            self.audio_queue.queue.clear()
+            self.audio_queue.queue.clear()  # Очищаем накопившиеся данные
 
     def restart(self):
-        self.print_with_time("Перезапуск...")
+        """Перезапускает ассистента"""
+        print_with_time("Перезапуск...")
         self.speak("Рестарт", interrupt=True)
         self.is_running = False
         python = sys.executable
-        os.execl(python, python, *sys.argv)
+        os.execl(python, python, *sys.argv)  # Запускаем новый процесс
 
     def process_user_input(self, text):
+        """Обрабатывает распознанный текст и формирует ответ"""
         responses = {
-            'greeting': [
-                "Приветствую!", 
-                "Здравствуйте!", 
-                "Привет!"
-            ],
-            'time': [
-                datetime.now().strftime('%H:%M'),
-            ],
+            'greeting': ["Приветствую!", "Здравствуйте!", "Привет!"],
+            'time': [datetime.now().strftime('%H:%M')],
             'weather': [
                 "Посмотрите погоду в приложении",
                 "Не могу узнать погоду, проверьте сами",
                 "Погоду лучше уточнить в интернете"
             ],
-            'thanks': [
-                "Всегда пожалуйста!",
-                "Не за что!",
-                "Рад помочь!"
-            ],
+            'thanks': ["Всегда пожалуйста!", "Не за что!", "Рад помочь!"],
             'help': [
-                "Команды: время, погода, перезагрузка. Управление громкостью: 'громкость на 50' или 'громкость на десять'. Скажите 'квант' перед командой.",
+                "Команды: время, погода, перезагрузка. Скажите 'квант' перед командой.",
                 "Просто скажите 'квант' и что вам нужно: время, погода, громкость и т.д."
             ],
-            'volume_set': [
-                "{}"
-            ],
-            'default': [
-                "Не понял",
-                "Повторите, пожалуйста"
-            ]
+            'volume_set': ["{}"],  # Шаблон для ответа о громкости
+            'default': ["Не понял", "Повторите, пожалуйста"]
         }
 
         # Обработка команд громкости
         if self.patterns['volume_set'].search(text):
-            # Ищем цифры
+            # Пытаемся найти цифры в команде
             numbers = re.findall(r'\d+', text)
             if numbers:
                 vol = int(numbers[0])
             else:
-                # Ищем слова-числа
+                # Ищем числительные в тексте
                 words = text.split()
                 vol = None
                 for word in words:
@@ -269,17 +347,17 @@ class VoiceAssistant:
                         vol = self.number_words[word]
                         break
                 
+                # Если не нашли число - сообщаем текущую громкость
                 if vol is None:
                     current_vol = self.volume_controller.get_volume()
-                    response = f"Текущая {current_vol}%"
+                    response = f"Текущая громкость {current_vol}%"
                     self.speak(response, interrupt=True)
                     self.deactivate(silent=True)
                     return
             
-            # Устанавливаем громкость
+            # Устанавливаем новую громкость
             new_vol = self.volume_controller.set_volume(vol)
-            response = random.choice(responses['volume_set']).format(new_vol)
-        
+            response = random.choice(responses['volume_set']).format(f"Громкость установлена на {new_vol}%")
         
         # Обработка остальных команд
         elif self.patterns['greeting'].search(text):
@@ -304,13 +382,16 @@ class VoiceAssistant:
         self.deactivate(silent=True)
 
     def run(self):
+        """Основной цикл работы ассистента"""
         try:
+            # Запускаем потоки для захвата и обработки аудио
             audio_thread = threading.Thread(target=self.audio_capture)
             process_thread = threading.Thread(target=self.process_audio)
             
             audio_thread.daemon = True
             process_thread.daemon = True
             
+            # Повышаем приоритет на Windows
             if sys.platform == 'win32':
                 try:
                     import win32api, win32process, win32con
@@ -322,15 +403,16 @@ class VoiceAssistant:
             audio_thread.start()
             process_thread.start()
             
+            # Основной цикл управления
             while self.is_running:
                 time.sleep(0.1)
                 
-                # Автоматическое отключение после периода неактивности
+                # Автоматическое отключение после таймаута неактивности
                 if self.is_active and (time.time() - self.last_activity) > ACTIVE_TIMEOUT:
                     self.deactivate()
                 
         except KeyboardInterrupt:
-            self.print_with_time("\nВыход...")
+            print_with_time("\nЗавершение работы...")
         finally:
             self.is_running = False
             os._exit(0)
