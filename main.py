@@ -19,6 +19,9 @@ import zipfile
 import shutil
 from tqdm import tqdm
 import requests
+import webbrowser
+import psutil
+import subprocess
 
 # Конфигурационные параметры
 MODELS_DIR = "models"  # Папка для хранения моделей распознавания речи
@@ -29,10 +32,26 @@ CHUNK_SIZE = 4000  # Размер чанка для аудиопотока
 KEYWORDS = ["квант", "кван", "ван"]  # Ключевые слова для активации
 ACTIVE_TIMEOUT = 7  # Таймаут неактивности в секундах
 
-def print_with_time(message):
-    """Выводит сообщение с текущим временем в формате [HH:MM:SS]"""
+# Пути к программам и браузерам
+BROWSER_PATH = 'C:/Program Files/Google/Chrome/Application/chrome.exe %s'
+PROGRAM_PATHS = {
+    'paint': r'C:\Windows\System32\mspaint.exe',
+    'telegram': r'C:\Users\User\AppData\Roaming\Telegram Desktop\Telegram.exe',
+    'yandex': r'C:\Users\User\AppData\Local\Yandex\YandexBrowser\Application\browser.exe'
+}
+browser = webbrowser.get(BROWSER_PATH)
+
+def print_with_time(message, color=None):
+    """Выводит сообщение с текущим временем и опциональным цветом"""
     current_time = datetime.now().strftime("%H:%M:%S")
-    print(f"[{current_time}] {message}")
+    colored_message = f"[{current_time}] {message}"
+    
+    if color == "green":
+        colored_message = f"\033[32m{colored_message}\033[0m"
+    elif color == "bold_green":
+        colored_message = f"\033[1;32m{colored_message}\033[0m"
+    
+    print(colored_message)
 
 def download_file(url, filename):
     """Скачивает файл с отображением прогресса через tqdm"""
@@ -56,10 +75,10 @@ def ensure_model_exists():
     os.makedirs(MODELS_DIR, exist_ok=True)
     
     if os.path.exists(model_path):
-        print_with_time("Модель для распознавания речи готова")
+        print_with_time("Модель для распознавания речи готова", color="green")
         return True
     
-    print_with_time(f"Модель {MODEL_NAME} не найдена, начинаю загрузку...")
+    print_with_time(f"Модель {MODEL_NAME} не найдена, начинаю загрузку...", color="green")
     
     try:
         zip_path = os.path.join(MODELS_DIR, "temp_model.zip")
@@ -79,7 +98,7 @@ def ensure_model_exists():
             if os.path.exists(extracted_dir):
                 shutil.move(extracted_dir, model_path)
         
-        print_with_time("Модель для распознавания готова")
+        print_with_time("Модель для распознавания готова", color="green")
         return True
     
     except Exception as e:
@@ -104,12 +123,11 @@ class VolumeController:
         self.volume.SetMasterVolumeLevelScalar(percent / 100.0, None)
         return percent
 
-
 class VoiceAssistant:
     """Основной класс голосового ассистента"""
     def __init__(self):
         self.start_time = datetime.now()
-        print_with_time("Запуск ассистента")
+        print_with_time("Запуск ассистента", color="bold_green")
         
         # Проверяем наличие модели распознавания речи
         if not ensure_model_exists():
@@ -155,7 +173,13 @@ class VoiceAssistant:
             'thanks': re.compile(r'(спасибо|благодарю|пасиб|спс)'),
             'restart': re.compile(r'(перезапуск|перезагрузись|обновись|рестарт)'),
             'help': re.compile(r'(помощь|помоги|что ты умеешь|команды|возможности)'),
-            'volume_set': re.compile(r'(громкость на|установи громкость|поставь громкость|громкость)')
+            'volume_set': re.compile(r'(громкость на|установи громкость|поставь громкость|громкость)'),
+            'search': re.compile(r'(поиск|найди|найти)'),
+            'open_paint': re.compile(r'(paint|рисовать)'),
+            'open_telegram': re.compile(r'(telegram|телеграм|телега)'),
+            'open_yandex': re.compile(r'(яндекс|браузер)'),
+            'deepseek_search': re.compile(r'(нейронка|нейросеть)'),
+            'system_status': re.compile(r'(состояние системы|загрузка системы|диск|диски)')
         }
 
     def init_asr(self):
@@ -176,7 +200,7 @@ class VoiceAssistant:
                 self.speaker = win32com.client.Dispatch("SAPI.SpVoice")
                 time.sleep(1)  # Даем время на инициализацию
                 self.voice_engine_ready = True
-                print_with_time("Голосовой движок готов")
+                print_with_time("Голосовой движок готов", color="green")
                 return
             except Exception as e:
                 if attempt < max_retries - 1:
@@ -226,8 +250,9 @@ class VoiceAssistant:
             start=False
         )
         
-        print_with_time(self.welcome_message)
+        print_with_time(self.welcome_message, color="bold_green")
         print("-" * 40)
+        self.speak("Готов")
         stream.start_stream()
         
         try:
@@ -266,7 +291,12 @@ class VoiceAssistant:
                     
                     # Обрабатываем только новые команды (защита от дублирования)
                     if text and (time.time() - last_processed_time > 0.5 or text != last_processed_text):
-                        print_with_time(f"Распознано: {text}")
+                        keyword_detected = any(keyword in text for keyword in KEYWORDS)
+                        
+                        # Выводим в консоль только если есть ключевое слово или в активном режиме
+                        if keyword_detected or self.is_active:
+                            print_with_time(f"Распознано: {text}")
+                        
                         self.handle_command(text)
                         last_processed_text = text
                         last_processed_time = time.time()
@@ -307,11 +337,37 @@ class VoiceAssistant:
 
     def restart(self):
         """Перезапускает ассистента"""
-        print_with_time("Перезапуск...")
-        self.speak("Рестарт", interrupt=True)
         self.is_running = False
         python = sys.executable
-        os.execl(python, python, *sys.argv)  # Запускаем новый процесс
+        print("-" * 40)
+        os.execl(python, python, *sys.argv)
+
+
+    def open_program(self, program_name):
+        """Открывает указанную программу"""
+        try:
+            if program_name in PROGRAM_PATHS:
+                path = PROGRAM_PATHS[program_name]
+                subprocess.Popen(path)
+                return True
+        except Exception as e:
+            print_with_time(f"Ошибка при открытии программы {program_name}: {e}")
+        return False
+
+    def get_system_status(self):
+        """Возвращает информацию только о загруженности дисков в формате 'C: 88% D: 90%'"""
+        disk_status = []
+        for partition in psutil.disk_partitions(all=False):
+            if partition.fstype and 'cdrom' not in partition.opts:
+                try:
+                    usage = psutil.disk_usage(partition.mountpoint)
+                    drive_letter = partition.mountpoint[0]
+                    percent = round(usage.percent)  # Округляем до целого числа
+                    disk_status.append(f"{drive_letter}: {percent}%")
+                except Exception:
+                    continue
+        
+        return f"Диски: {' '.join(disk_status)}"
 
     def process_user_input(self, text):
         """Обрабатывает распознанный текст и формирует ответ"""
@@ -329,6 +385,13 @@ class VoiceAssistant:
                 "Просто скажите 'квант' и что вам нужно: время, погода, громкость и т.д."
             ],
             'volume_set': ["{}"],  # Шаблон для ответа о громкости
+            'search': ["Ищу информацию в интернете"],
+            'open_paint': ["Открываю Paint"],
+            'open_telegram': ["Открываю Telegram"],
+            'open_yandex': ["Открываю Яндекс Браузер"],
+            'deepseek_search': ["Открываю DeepSeek в браузере"],
+            'system_status': ["{}"],
+            'restart': ["Выполняю перезапуск"],  
             'default': ["Не понял", "Повторите, пожалуйста"]
         }
 
@@ -358,6 +421,46 @@ class VoiceAssistant:
             # Устанавливаем новую громкость
             new_vol = self.volume_controller.set_volume(vol)
             response = random.choice(responses['volume_set']).format(f"Громкость установлена на {new_vol}%")
+        
+        # Поиск информации в интернете
+        elif self.patterns['search'].search(text):
+            query = re.sub(r'(поиск|найди|найти)\s*', '', text).strip()
+            if query:
+                browser.open(f"https://www.google.com/search?q={query}")
+                response = random.choice(responses['search'])
+            else:
+                response = "Что нужно найти?"
+        
+        # Открытие Paint
+        elif self.patterns['open_paint'].search(text):
+            if self.open_program('paint'):
+                response = random.choice(responses['open_paint'])
+            else:
+                response = "Не удалось открыть Paint"
+        
+        # Открытие Telegram
+        elif self.patterns['open_telegram'].search(text):
+            if self.open_program('telegram'):
+                response = random.choice(responses['open_telegram'])
+            else:
+                response = "Не удалось открыть Telegram"
+        
+        # Открытие Яндекс Браузера
+        elif self.patterns['open_yandex'].search(text):
+            if self.open_program('yandex'):
+                response = random.choice(responses['open_yandex'])
+            else:
+                response = "Не удалось открыть Яндекс Браузер"
+        
+        # Поиск в DeepSeek
+        elif self.patterns['deepseek_search'].search(text):
+            browser.open("https://www.deepseek.com")
+            response = random.choice(responses['deepseek_search'])
+        
+        # Состояние системы (включая диски)
+        elif self.patterns['system_status'].search(text):
+            status = self.get_system_status()
+            response = random.choice(responses['system_status']).format(status)
         
         # Обработка остальных команд
         elif self.patterns['greeting'].search(text):
