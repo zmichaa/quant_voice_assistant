@@ -1,0 +1,8 @@
+vosk==0.3.45
+pyaudio==0.2.13
+pywin32==306
+requests==2.31.0
+tqdm==4.66.1
+psutil==5.9.6
+pycaw==20230418
+comtypes==1.2.0
