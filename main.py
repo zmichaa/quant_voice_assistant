@@ -22,6 +22,7 @@ import requests
 import webbrowser
 import psutil
 import subprocess
+from datetime import datetime, timedelta
 
 # Конфигурационные параметры
 MODELS_DIR = "models"  # Папка для хранения моделей распознавания речи
@@ -147,6 +148,8 @@ class VoiceAssistant:
         self.init_voice_engine()
         
         self.volume_controller = VolumeController()
+        self.timers = {}  # Словарь для хранения активных таймеров
+        self.timer_counter = 0  # Счетчик для идентификаторов таймеров
         
         # Словарь для преобразования слов в числа
         self.number_words = {
@@ -179,7 +182,8 @@ class VoiceAssistant:
             'open_telegram': re.compile(r'(telegram|телеграм|телега)'),
             'open_yandex': re.compile(r'(яндекс|браузер)'),
             'deepseek_search': re.compile(r'(нейронка|нейросеть)'),
-            'system_status': re.compile(r'(состояние системы|загрузка системы|диск|диски)')
+            'system_status': re.compile(r'(состояние системы|загрузка системы|диск|диски)'),
+            'timer': re.compile(r'(таймер|засеки|засечь|поставь таймер)')
         }
 
     def init_asr(self):
@@ -235,6 +239,60 @@ class VoiceAssistant:
             if not silent:
                 self.speak("Режим ожидания", interrupt=True)
             self.audio_queue.queue.clear()  # Очищаем очередь аудио
+
+    def set_timer(self, duration_sec, timer_id=None):
+        """Устанавливает таймер и запускает его в отдельном потоке"""
+        if timer_id is None:
+            self.timer_counter += 1
+            timer_id = self.timer_counter
+        
+        def timer_thread():
+            start_time = time.time()
+            time_left = duration_sec
+            
+            # Периодически проверяем оставшееся время
+            while time_left > 0 and self.is_running:
+                time.sleep(1)
+                time_left = duration_sec - (time.time() - start_time)
+            
+            if not self.is_running:
+                return
+                
+            # Проигрываем звуковое уведомление
+            try:
+                import winsound
+                for _ in range(3):  # Три сигнала
+                    winsound.Beep(1000, 500)  # Частота 1000 Гц, длительность 500 мс
+                    time.sleep(0.3)
+            except:
+                pass
+                
+            # Форматируем длительность таймера
+            if duration_sec >= 60:
+                minutes = duration_sec // 60
+                seconds = duration_sec % 60
+                if seconds > 0:
+                    duration_str = f"{minutes} минут {seconds} секунд"
+                else:
+                    duration_str = f"{minutes} минут"
+            else:
+                duration_str = f"{duration_sec} сек"
+                
+            # Произносим сообщение с информацией о длительности
+            with self.speaker_lock:
+                self.speak(f"Таймер {timer_id} на {duration_str} завершил работу!", interrupt=True)
+                if timer_id in self.timers:
+                    del self.timers[timer_id]
+        
+        timer = threading.Thread(target=timer_thread)
+        timer.daemon = True
+        self.timers[timer_id] = {
+            'thread': timer,
+            'end_time': time.time() + duration_sec,
+            'duration': duration_sec
+        }
+        timer.start()
+        return timer_id
 
     def audio_capture(self):
         """Поток для захвата аудио с микрофона"""
@@ -342,7 +400,6 @@ class VoiceAssistant:
         print("-" * 40)
         os.execl(python, python, *sys.argv)
 
-
     def open_program(self, program_name):
         """Открывает указанную программу"""
         try:
@@ -391,6 +448,9 @@ class VoiceAssistant:
             'open_yandex': ["Открываю Яндекс Браузер"],
             'deepseek_search': ["Открываю DeepSeek в браузере"],
             'system_status': ["{}"],
+            'timer': [
+                "Таймер {}",
+            ],
             'restart': ["Выполняю перезапуск"],  
             'default': ["Не понял", "Повторите, пожалуйста"]
         }
@@ -421,6 +481,59 @@ class VoiceAssistant:
             # Устанавливаем новую громкость
             new_vol = self.volume_controller.set_volume(vol)
             response = random.choice(responses['volume_set']).format(f"Громкость установлена на {new_vol}%")
+        
+        # Обработка таймера
+        elif self.patterns['timer'].search(text):
+                # Ищем время в формате "X минут(ы/у)" или "X секунд(ы/у)"
+                time_match = re.search(r'(\d+)\s*(минут[а-я]*|секунд[а-я]*)', text)
+                if time_match:
+                        value = int(time_match.group(1))
+                        unit = time_match.group(2)
+                        
+                        if 'минут' in unit:
+                                duration = value * 60
+                                time_str = f"{value} мин"
+                        elif 'секунд' in unit:
+                                duration = value
+                                time_str = f"{value} сек"
+                        else:
+                                response = "Укажите единицы измерения (минуты или секунды)"
+                                self.speak(response, interrupt=True)
+                                self.deactivate(silent=True)
+                                return
+                        
+                        timer_id = self.set_timer(duration)
+                        response = random.choice(responses['timer']).format(time_str)
+                else:
+                        # Попробуем найти числительные слова
+                        words = text.split()
+                        value = None
+                        unit = None
+                        
+                        # Ищем числительное
+                        for word in words:
+                                if word in self.number_words:
+                                        value = self.number_words[word]
+                                        break
+                        
+                        # Ищем единицы измерения
+                        if any('минут' in w for w in words):
+                                unit = 'минут'
+                        elif any('секунд' in w for w in words):
+                                unit = 'секунд'
+                        
+                        if value is not None and unit is not None:
+                                if unit == 'минут':
+                                        duration = value * 60
+                                        time_str = f"{value} мин"
+                                else:
+                                        duration = value
+                                        time_str = f"{value} сек"
+                                
+                                timer_id = self.set_timer(duration)
+                                response = random.choice(responses['timer']).format(time_str)
+                        else:
+                                response = "Сколько времени поставить на таймер? (например, 5 минут или 30 секунд)"
         
         # Поиск информации в интернете
         elif self.patterns['search'].search(text):
